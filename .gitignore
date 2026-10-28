@@ -24,3 +24,7 @@ dist-ssr
 *.sw?
 
 target
+
+# Browser test artifacts
+test-results/
+playwright-report/

@@ -51,9 +51,12 @@ export class OutputWriter {
     try {
       while (this.#queue.length && !this.#error) {
         const data = this.#queue.shift()!;
+        // A sink may transfer the buffer, detaching it during write().
+        const byteLength = data.byteLength;
+
         await this.#writer.write(data);
 
-        if (!this.#error) this.#pendingBytes -= data.byteLength;
+        if (!this.#error) this.#pendingBytes -= byteLength;
       }
     } catch (reason) {
       this.fail(asError(reason));

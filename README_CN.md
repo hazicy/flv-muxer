@@ -135,3 +135,15 @@ await finished;
 #### 属性
 
 - **`state`**: 返回复用器状态。值为 `"recording"`、`"paused"` 或 `"inactive"`。
+
+## 测试
+
+```sh
+pnpm test --run                 # 单元测试
+pnpm exec tsc --noEmit          # 类型检查
+pnpm test:browser              # 真实 Chrome 集成测试，约 45 秒
+```
+
+浏览器测试需要 Node.js 20+ 和已安装的 Google Chrome。使用原生 WebCodecs 编解码合成音视频，覆盖 FLV 完整性、时间戳同步、30 秒视频停帧、暂停重启、慢速输出丢帧、缓冲区转移及写入失败。静止用例会采样 GC 后的 JS 堆（不含原生编码器内存）；FLV 和采样结果保存在 `test-results/browser/`。
+
+实时用例显式使用 `prefer-software`；默认编码路径用例将编码队列上限设为 `128`、交织等待设为 `5000ms`，以容纳冷启动。本机默认路径启动约 2 秒，默认预算可能过载或前移迟到帧时间戳；这些测试不代表所有硬件的默认配置都适用，也不覆盖屏幕采集权限和第三方播放器。

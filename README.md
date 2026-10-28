@@ -135,3 +135,15 @@ await finished;
 #### Properties
 
 - **`state`**: Returns the current state of the multiplexer. Possible values are `"recording"`, `"paused"`, or `"inactive"`.
+
+## Tests
+
+```sh
+pnpm test --run                 # Unit tests
+pnpm exec tsc --noEmit          # Type checking
+pnpm test:browser              # Native Chrome integration tests, about 45 seconds
+```
+
+Browser tests require Node.js 20+ and an installed Google Chrome. Native WebCodecs encode and decode synthetic audio/video to check FLV integrity, timestamp synchronization, a 30-second video stall, pause/restart, slow-output frame dropping, buffer transfer, and write failures. The static case samples retained JS heap after GC (not native codec memory); FLV files and heap samples are saved under `test-results/browser/`.
+
+Realtime cases explicitly use `prefer-software`. The default encoder path uses an encode queue limit of `128` and a `5000ms` interleaving wait to accommodate cold starts. Its startup took about two seconds locally; default budgets can overload or move late video timestamps forward. These tests do not establish suitable defaults for all hardware or cover screen-capture permissions and third-party players.

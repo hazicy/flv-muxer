@@ -76,3 +76,24 @@ it("reports a sink failure even without a pending write", async () => {
   await expect(output.drain()).rejects.toBe(error);
   expect(sink.locked).toBe(false);
 });
+
+it("releases its byte budget when the sink transfers and detaches the buffer", async () => {
+  const onError = vi.fn();
+  const output = new OutputWriter(
+    new WritableStream<Uint8Array>({
+      write(data) {
+        structuredClone(data, { transfer: [data.buffer] });
+      },
+    }),
+    4,
+    onError
+  );
+
+  output.enqueue(new Uint8Array(4));
+  await output.drain();
+  expect(output.pressured).toBe(false);
+  output.enqueue(new Uint8Array(4));
+  await output.drain();
+  expect(onError).not.toHaveBeenCalled();
+  output.release();
+});
