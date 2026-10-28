@@ -4,20 +4,7 @@ import { Logger } from "../utils/logger";
 export type EventHandler = (...args: any[]) => void;
 
 export class EventBus {
-  static #instance: EventBus;
-  #events: Map<string, EventHandler[]>;
-
-  private constructor() {
-    this.#events = new Map();
-  }
-
-  static getInstance() {
-    if (!this.#instance) {
-      this.#instance = new EventBus();
-    }
-
-    return this.#instance;
-  }
+  #events = new Map<string, EventHandler[]>();
 
   on(eventName: string, handler: EventHandler): void {
     if (!this.#events.has(eventName)) {

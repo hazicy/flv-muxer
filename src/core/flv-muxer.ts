@@ -24,6 +24,8 @@ interface AudioOptions {
 interface MuxerOptions {
   mode: MuxerMode;
   chunked: boolean;
+  maxInterleaveDelayMs?: number;
+  maxPendingChunks?: number;
   video?: VideoOptions;
   audio?: AudioOptions;
 }
@@ -34,6 +36,8 @@ export class FlvMuxer {
   readonly #streamProcessor: StreamProcessor;
   readonly #outputStream: WritableStream | undefined;
 
+  #pipeline?: Promise<void>;
+  #stopping?: Promise<void>;
   #options: MuxerOptions;
   #sourceStream: ReadableStream | undefined;
   #sourceStreamController: ReadableStreamDefaultController | undefined;
@@ -50,6 +54,8 @@ export class FlvMuxer {
     options: {
       mode: MuxerMode;
       chunked: boolean;
+      maxInterleaveDelayMs?: number;
+      maxPendingChunks?: number;
     }
   ) {
     if (!(writable instanceof WritableStream)) {
@@ -59,10 +65,14 @@ export class FlvMuxer {
     }
 
     this.#encoder = new FlvEncoder();
-    this.#eventBus = EventBus.getInstance();
-    this.#streamProcessor = StreamProcessor.getInstance();
+    this.#eventBus = new EventBus();
+    this.#streamProcessor = new StreamProcessor(
+      this.#eventBus,
+      options.maxInterleaveDelayMs,
+      options.maxPendingChunks
+    );
     this.#outputStream = writable;
-    this.#options = options;
+    this.#options = { ...options };
 
     // 初始化策略
     this.#initStrategies();
@@ -80,6 +90,9 @@ export class FlvMuxer {
   }
 
   configureAudio(options: AudioOptions): void {
+    if (this.state !== "inactive" || this.#stopping)
+      throw new Error("Configure tracks before starting");
+
     if (!options.encoderConfig) {
       throw new Error("Audio encoder configuration cannot be empty");
     }
@@ -87,23 +100,45 @@ export class FlvMuxer {
     this.#options.audio = options;
 
     this.#streamProcessor.addAudioTrack(
-      new AudioEncoderTrack(options.encoderConfig)
+      new AudioEncoderTrack(
+        options.encoderConfig,
+        this.#eventBus,
+        this.#streamProcessor.trackState
+      )
     );
   }
 
   configureVideo(options: VideoOptions): void {
+    if (this.state !== "inactive" || this.#stopping)
+      throw new Error("Configure tracks before starting");
+
     if (!options.encoderConfig) {
       throw new Error("Video encoder configuration cannot be empty");
+    }
+
+    if (
+      !Number.isInteger(options.keyframeInterval) ||
+      options.keyframeInterval < 1
+    ) {
+      throw new Error("keyframeInterval must be a positive integer");
     }
 
     this.#options.video = options;
 
     this.#streamProcessor.addVideoTrack(
-      new VideoEncoderTrack(options.encoderConfig, options.keyframeInterval)
+      new VideoEncoderTrack(
+        options.encoderConfig,
+        options.keyframeInterval,
+        this.#eventBus,
+        this.#streamProcessor.trackState
+      )
     );
   }
 
   async start(): Promise<void> {
+    if (this.state !== "inactive" || this.#stopping)
+      throw new Error("Muxer is already active");
+
     if (!this.#options?.audio && !this.#options?.video) {
       throw new Error(
         "Muxer is not configured with audio or video tracks. Please call configureAudio() or configureVideo() first."
@@ -120,11 +155,13 @@ export class FlvMuxer {
 
       this.#streamProcessor.start();
 
-      return this.#sourceStream
+      this.#pipeline = this.#sourceStream
         .pipeThrough(this.#muxStream)
         .pipeTo(this.#outputStream, {
           preventClose: true,
         });
+
+      await this.#pipeline;
     } catch (error) {
       throw new Error(`Error starting Muxer: ${error}`);
     }
@@ -139,12 +176,25 @@ export class FlvMuxer {
   }
 
   stop(): Promise<void> {
-    if (this.#readableHandler) {
-      this.#eventBus.off("CHUNK_PUBLISH", this.#readableHandler);
-    }
+    if (this.#stopping) return this.#stopping;
+    if (this.state === "inactive") return Promise.resolve();
 
-    this.#sourceStreamController?.close();
-    return this.#streamProcessor.stop();
+    this.#stopping = (async () => {
+      try {
+        await this.#streamProcessor.stop();
+        this.#sourceStreamController?.close();
+        await this.#pipeline;
+      } finally {
+        if (this.#readableHandler) {
+          this.#eventBus.off("CHUNK_PUBLISH", this.#readableHandler);
+        }
+
+        this.#sourceStreamController = undefined;
+        this.#stopping = undefined;
+      }
+    })();
+
+    return this.#stopping;
   }
 
   #initSourceStream(): void {

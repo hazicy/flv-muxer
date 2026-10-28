@@ -1,7 +1,5 @@
-import {
-  type AudioEncoderTrack,
-  type VideoEncoderTrack,
-} from "./encoder-track";
+import type { AudioEncoderTrack, VideoEncoderTrack } from "./encoder-track";
+import { TrackState } from "./encoder-track";
 import { EventBus } from "./event-bus";
 
 export type ProcessorState = "recording" | "paused" | "inactive";
@@ -9,209 +7,201 @@ export type ProcessorState = "recording" | "paused" | "inactive";
 export interface TrackChunk {
   type: "AAC_RAW" | "AAC_SE" | "AVC_SE" | "AVC_NALU";
   data: Uint8Array;
-  // PTS
-  // [https://w3c.github.io/webcodecs/#dom-encodedvideochunk-timestamp-slot]
+  // Relative presentation timestamp in milliseconds.
   timestamp: number;
   isKey: boolean;
 }
 
 export class StreamProcessor {
-  static instance: StreamProcessor;
-
   state: ProcessorState = "inactive";
+  readonly trackState = new TrackState();
 
-  #eventBus: EventBus;
-  #audioEncoderTrack: AudioEncoderTrack | undefined;
-  #videoEncoderTrack: VideoEncoderTrack | undefined;
-  #audioConfigReady: boolean = false;
-  #videoConfigReady: boolean = false;
+  #audioEncoderTrack?: AudioEncoderTrack;
+  #videoEncoderTrack?: VideoEncoderTrack;
 
-  private constructor() {
-    this.#eventBus = EventBus.getInstance();
+  #queue: { chunk: TrackChunk; arrival: number }[] = [];
+  #audioTimestamp = -Infinity;
+  #videoTimestamp = -Infinity;
+  #lastPublishedTimestamp = 0;
 
-    this.#initListeners();
-  }
+  #timer?: ReturnType<typeof setTimeout>;
+  #transition?: Promise<void>;
 
-  #initListeners(): void {
-    this.#eventBus.on("TRACK_CHUNK", (chunk) => {
-      this.handleTrackChunk(chunk as TrackChunk);
-    });
-  }
-
-  setAudioConfigReady(): void {
-    this.#audioConfigReady = true;
-  }
-
-  setVideoConfigReady(): void {
-    this.#videoConfigReady = true;
-  }
-
-  static getInstance(): StreamProcessor {
-    if (!this.instance) {
-      this.instance = new this();
+  constructor(
+    private readonly eventBus: EventBus,
+    private readonly maxInterleaveDelayMs = 200,
+    private readonly maxPendingChunks = 256
+  ) {
+    if (
+      !Number.isFinite(maxInterleaveDelayMs) ||
+      maxInterleaveDelayMs < 0 ||
+      !Number.isInteger(maxPendingChunks) ||
+      maxPendingChunks < 1
+    ) {
+      throw new Error("Invalid interleave queue limits");
     }
 
-    return this.instance;
+    eventBus.on("TRACK_CHUNK", (chunk: TrackChunk) =>
+      this.handleTrackChunk(chunk)
+    );
   }
 
   addTrackChunk(type: "audio" | "video", chunk: VideoFrame | AudioData): void {
-    if (this.state !== "recording") {
+    const track =
+      type === "audio" ? this.#audioEncoderTrack : this.#videoEncoderTrack;
+
+    if (this.state !== "recording" || !track) {
       chunk.close();
       return;
     }
 
-    if (type === "audio") {
-      this.#audioEncoderTrack?.addTrackChunk(chunk);
-    } else if (type === "video") {
-      this.#videoEncoderTrack?.addTrackChunk(chunk);
-    }
+    // Anchor to input order, independently of encoder callback scheduling.
+    this.trackState.offsetTimestamp ??= chunk.timestamp;
+    track.addTrackChunk(chunk);
   }
 
   addAudioTrack(track: AudioEncoderTrack): void {
+    this.#audioEncoderTrack?.close();
     this.#audioEncoderTrack = track;
   }
 
   addVideoTrack(track: VideoEncoderTrack): void {
+    this.#videoEncoderTrack?.close();
     this.#videoEncoderTrack = track;
   }
 
   handleTrackChunk(chunk: TrackChunk): void {
-    // 如果只有单个轨道，则发出该数据块
-    if (!this.#audioEncoderTrack || !this.#videoEncoderTrack) {
-      this.#publishChunk(chunk);
+    if (chunk.type === "AAC_SE" || chunk.type === "AVC_SE") {
+      this.eventBus.emit("CHUNK_PUBLISH", chunk);
       return;
     }
 
-    if (chunk.type === "AAC_SE") {
-      if (!this.#audioConfigReady) {
-        this.setAudioConfigReady();
-      }
+    if (chunk.type === "AAC_RAW")
+      this.#audioTimestamp = Math.max(this.#audioTimestamp, chunk.timestamp);
+    else this.#videoTimestamp = Math.max(this.#videoTimestamp, chunk.timestamp);
 
-      this.#publishChunk(chunk);
-      return;
+    this.#queue.push({ chunk, arrival: performance.now() });
+    this.#queue.sort((a, b) => a.chunk.timestamp - b.chunk.timestamp);
+
+    this.#drain();
+  }
+
+  #drain(force = false): void {
+    clearTimeout(this.#timer);
+
+    const watermark =
+      !this.#audioEncoderTrack || !this.#videoEncoderTrack
+        ? Infinity
+        : Math.min(this.#audioTimestamp, this.#videoTimestamp);
+
+    // Release sorted predecessors too if an older arrival is behind them.
+    const now = performance.now();
+    const expiredTimestamp = this.#queue.reduce(
+      (latest, entry) =>
+        now - entry.arrival >= this.maxInterleaveDelayMs
+          ? Math.max(latest, entry.chunk.timestamp)
+          : latest,
+      -Infinity
+    );
+
+    while (this.#queue.length) {
+      const head = this.#queue[0];
+
+      if (
+        !force &&
+        head.chunk.timestamp > watermark &&
+        head.chunk.timestamp > expiredTimestamp &&
+        this.#queue.length <= this.maxPendingChunks
+      )
+        break;
+
+      this.#queue.shift();
+
+      // Keep reference frames: late packets are retimestamped rather than dropped.
+      const timestamp = Math.max(
+        this.#lastPublishedTimestamp,
+        head.chunk.timestamp
+      );
+
+      this.#lastPublishedTimestamp = timestamp;
+      this.eventBus.emit("CHUNK_PUBLISH", { ...head.chunk, timestamp });
     }
 
-    if (chunk.type === "AVC_SE") {
-      if (!this.#videoConfigReady) {
-        this.setVideoConfigReady();
-      }
+    if (this.#queue.length) {
+      const oldestArrival = Math.min(
+        ...this.#queue.map((entry) => entry.arrival)
+      );
 
-      this.#publishChunk(chunk);
-      return;
-    }
-
-    // 如果是音频包
-    if (chunk.type === "AAC_RAW") {
-      this.#processAudioChunk(chunk);
-      return;
-    }
-
-    // 如果是视频包
-    if (chunk.type === "AVC_NALU") {
-      this.#processVideoChunk(chunk);
-      return;
+      this.#timer = setTimeout(
+        () => this.#drain(),
+        Math.max(
+          1,
+          this.maxInterleaveDelayMs - (performance.now() - oldestArrival)
+        )
+      );
     }
   }
 
   start(): void {
-    if (this.state !== "inactive") {
-      return;
-    }
+    if (this.state !== "inactive" || this.#transition)
+      throw new Error("Processor is already active");
 
     this.state = "recording";
   }
 
-  async pause(): Promise<void> {
-    if (this.state !== "recording") {
-      return;
-    }
-
-    await this.#flush();
+  pause(): Promise<void> {
+    if (this.#transition) return this.#transition;
+    if (this.state !== "recording") return Promise.resolve();
 
     this.state = "paused";
+
+    return this.#flush();
   }
 
   resume(): void {
-    if (this.state !== "paused") {
-      return;
-    }
+    if (this.#transition)
+      throw new Error("Wait for pause() to finish before resuming");
 
-    this.state = "recording";
+    if (this.state === "paused") this.state = "recording";
   }
 
   async stop(): Promise<void> {
-    if (this.state !== "recording") {
-      return;
-    }
+    if (this.state === "inactive") return;
 
+    this.state = "paused";
+
+    if (this.#transition) await this.#transition;
     await this.#flush();
 
     this.reset();
-
     this.state = "inactive";
   }
 
   reset(): void {
+    clearTimeout(this.#timer);
+
+    this.#queue = [];
+    this.#audioTimestamp = this.#videoTimestamp = -Infinity;
+    this.#lastPublishedTimestamp = 0;
+
     this.#videoEncoderTrack?.reset();
-    this.#videoConfigReady = false;
-
     this.#audioEncoderTrack?.reset();
-    this.#audioConfigReady = false;
+    this.trackState.offsetTimestamp = undefined;
   }
 
-  async #flush(): Promise<void> {
-    await this.#audioEncoderTrack?.flush();
-    await this.#videoEncoderTrack?.flush();
-  }
+  #flush(): Promise<void> {
+    this.#transition = Promise.all([
+      this.#audioEncoderTrack?.flush(),
+      this.#videoEncoderTrack?.flush(),
+    ])
+      .then(() => {
+        this.#drain(true);
+      })
+      .finally(() => {
+        clearTimeout(this.#timer);
+        this.#transition = undefined;
+      });
 
-  #processAudioChunk(chunk: TrackChunk): void {
-    const audioTrack = this.#audioEncoderTrack!;
-    const videoTrack = this.#videoEncoderTrack!;
-
-    if (!this.#audioConfigReady || !this.#videoConfigReady) {
-      audioTrack.enqueue(chunk);
-      return;
-    }
-
-    while (
-      !videoTrack.isEmpty() &&
-      videoTrack.peek()!.timestamp <= chunk.timestamp
-    ) {
-      this.#publishChunk(videoTrack.dequeue());
-    }
-
-    if (chunk.timestamp <= videoTrack.lastTimestamp) {
-      this.#publishChunk(chunk);
-    } else {
-      audioTrack.enqueue(chunk);
-    }
-  }
-
-  #processVideoChunk(chunk: TrackChunk): void {
-    const audioTrack = this.#audioEncoderTrack!;
-    const videoTrack = this.#videoEncoderTrack!;
-
-    if (!this.#audioConfigReady || !this.#videoConfigReady) {
-      videoTrack.enqueue(chunk);
-      return;
-    }
-
-    while (
-      !audioTrack.isEmpty() &&
-      audioTrack.peek()!.timestamp <= chunk.timestamp
-    ) {
-      this.#publishChunk(audioTrack.dequeue());
-    }
-
-    if (chunk.timestamp <= audioTrack.lastTimestamp) {
-      this.#publishChunk(chunk);
-    } else {
-      videoTrack.enqueue(chunk);
-    }
-  }
-
-  #publishChunk(chunk: TrackChunk | undefined): void {
-    if (!chunk) return;
-    this.#eventBus.emit("CHUNK_PUBLISH", chunk);
+    return this.#transition;
   }
 }

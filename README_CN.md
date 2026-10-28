@@ -37,17 +37,26 @@ const muxer = new FlvMuxer(
   options: {
     mode: "record" | "live";
     chunked: boolean; // 是否分块传输
+    maxInterleaveDelayMs?: number;
+    maxPendingChunks?: number;
   }
 )
 ```
 
+| 可选参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `maxInterleaveDelayMs` | `200` | 交织最大等待毫秒数，有限非负数 |
+| `maxPendingChunks` | `256` | 交织队列最大包数，正整数 |
+
+轨道停帧时，等待超时或队列超限会继续输出，不会自动补视频帧。迟到包的时间戳会向前调整，可能压缩播放间隔。上述限制仅针对交织队列。
+
 #### 方法
 
-- **`configureAudio()`**: 配置音频编码器
+- **`configureAudio()`**: 配置音频编码器，必须在启动前调用。
 
   ```ts
   flvMuxer.configureAudio({
-    encoderConfig: AudioEncoderConfig;  
+    encoderConfig: AudioEncoderConfig;
   });
 
   // 示例
@@ -62,11 +71,11 @@ const muxer = new FlvMuxer(
 
   音频编码器配置：[AudioEncoderConfig](https://developer.mozilla.org/en-US/docs/Web/API/AudioEncoder/configure#config)。
 
-- **`configureVideo()`**: 配置视频编码器
+- **`configureVideo()`**: 配置视频编码器。必须在启动前调用，`keyframeInterval` 必须为正整数。
 
   ```ts
   muxer.configureVideo({
-    encoderConfig: VideoEncoderConfig;  
+    encoderConfig: VideoEncoderConfig;
     keyframeInterval: number, // 关键帧间隔，单位为帧数
   });
 
@@ -82,23 +91,36 @@ const muxer = new FlvMuxer(
   });
   ```
 
-  视频编码器配置: [VideoEncoderConfig](https://developer.mozilla.org/en-US/docs/Web/API/VideoEncoder/configure#config).  
+  视频编码器配置: [VideoEncoderConfig](https://developer.mozilla.org/en-US/docs/Web/API/VideoEncoder/configure#config).
 
 - **`addRawChunk`**: 添加原始帧数据。
 
   ```ts
-  flvMuxer.addRawChunk("video" ｜ "audio", chunk: VideoFrame | AudioData);
+  flvMuxer.addRawChunk("video" | "audio", chunk: VideoFrame | AudioData);
 
   // 示例
   flvMuxer.addRawChunk("video", chunk);
   ```
 
-- **`start()`**: 开始复用器，接收并处理数据
-- **`pause()`**: 暂停复用器，暂时停止数据处理
-- **`resume()`**: 恢复复用器，继续处理数据
-- **`stop()`**: 停止复用器，终止数据处理
+- **`start(): Promise<void>`**：开始处理，至少需配置一条轨道；重复启动会报错。Promise 在输出管线结束时完成。
+- **`pause(): Promise<void>`**：暂停并排空待处理数据，完成后才能恢复。
+- **`resume(): void`**：恢复处理。
+- **`stop(): Promise<void>`**：停止并等待剩余数据写入，支持暂停后停止。输出流保持打开，可重新开始。
+
+#### 调用示例
+
+```ts
+// 配置轨道后启动；此处不要 await。
+const finished = muxer.start();
+muxer.addRawChunk("video", frame); // 采集期间持续输入
+
+await muxer.pause(); // 需要暂停时
+muxer.resume();
+
+await muxer.stop();
+await finished;
+```
 
 #### 属性
 
 - **`state`**: 返回复用器状态。值为 `"recording"`、`"paused"` 或 `"inactive"`。
-

@@ -1,43 +1,24 @@
 import { Logger } from "../utils/logger";
 import { EventBus } from "./event-bus";
-import type { MuxerMode } from "./flv-muxer";
-import { StreamProcessor, type TrackChunk } from "./stream-processor";
 
 type EncodedMediaChunk = EncodedAudioChunk | EncodedVideoChunk;
 type MediaDecoderConfig = AudioDecoderConfig | VideoDecoderConfig;
 
-class TrackState {
-  static #instance: TrackState;
-
-  offsetTimestamp: number = 0;
-
-  static getInstance() {
-    if (!this.#instance) {
-      this.#instance = new this();
-    }
-
-    return this.#instance;
-  }
+export class TrackState {
+  offsetTimestamp: number | undefined;
 }
 
 export abstract class BaseEncoderTrack {
   readonly eventBus: EventBus;
-  readonly mode: MuxerMode = "record";
   readonly config: VideoEncoderConfig | AudioEncoderConfig;
 
-  queue: TrackChunk[] = [];
   encoder: VideoEncoder | AudioEncoder | undefined;
   trackState: TrackState;
-  lastTimestamp: number = 0;
 
   private _decoderConfig: AudioDecoderConfig | VideoDecoderConfig | undefined;
 
   get decoderConfig(): VideoDecoderConfig | undefined {
     return this._decoderConfig;
-  }
-
-  get state() {
-    return StreamProcessor.getInstance().state;
   }
 
   set decoderConfig(config: MediaDecoderConfig) {
@@ -61,9 +42,13 @@ export abstract class BaseEncoderTrack {
     }
   }
 
-  constructor(config: VideoEncoderConfig | AudioEncoderConfig) {
-    this.eventBus = EventBus.getInstance();
-    this.trackState = TrackState.getInstance();
+  constructor(
+    config: VideoEncoderConfig | AudioEncoderConfig,
+    eventBus: EventBus,
+    trackState: TrackState
+  ) {
+    this.eventBus = eventBus;
+    this.trackState = trackState;
     this.config = config;
 
     this.initEncoder(config);
@@ -80,31 +65,7 @@ export abstract class BaseEncoderTrack {
     config: VideoEncoderConfig | AudioEncoderConfig
   ): void;
 
-  enqueue(chunk: TrackChunk): void {
-    this.queue.push(chunk);
-  }
-
-  dequeue(): TrackChunk | undefined {
-    return this.queue.shift();
-  }
-
-  peek(): TrackChunk | undefined {
-    return this.queue[0];
-  }
-
-  isEmpty(): boolean {
-    return this.queue.length === 0;
-  }
-
-  length() {
-    return this.queue.length;
-  }
-
   close(): void {
-    if (this.state !== "recording") {
-      throw new Error("Cannot stop track as it is not currently recording.");
-    }
-
     if (!this.encoder) {
       throw new Error("Encoder is not initialized.");
     }
@@ -113,11 +74,11 @@ export abstract class BaseEncoderTrack {
   }
 
   reset(): void {
-    if (this.trackState.offsetTimestamp !== 0) {
-      this.trackState.offsetTimestamp = 0;
-    }
-
     this._decoderConfig = undefined;
+    this.encoder?.reset();
+    this.encoder?.configure(
+      this.config as VideoEncoderConfig & AudioEncoderConfig
+    );
   }
 
   async flush(): Promise<void> {
@@ -129,7 +90,7 @@ export abstract class BaseEncoderTrack {
   }
 
   protected calculateTimestamp(timestamp: number) {
-    if (!this.trackState.offsetTimestamp) {
+    if (this.trackState.offsetTimestamp === undefined) {
       this.trackState.offsetTimestamp = timestamp;
     }
 
@@ -141,8 +102,13 @@ export class VideoEncoderTrack extends BaseEncoderTrack {
   #frameCount: number = 0;
   #keyframeInterval: number = 90;
 
-  constructor(config: VideoEncoderConfig, keyframeInterval: number) {
-    super(config);
+  constructor(
+    config: VideoEncoderConfig,
+    keyframeInterval: number,
+    eventBus: EventBus,
+    trackState: TrackState
+  ) {
+    super(config, eventBus, trackState);
 
     this.#keyframeInterval = keyframeInterval;
   }
@@ -160,22 +126,18 @@ export class VideoEncoderTrack extends BaseEncoderTrack {
   }
 
   addTrackChunk(frame: VideoFrame | AudioData): void {
-    if (this.state !== "recording") {
-      frame.close();
-      return;
-    }
-
     if (!this.encoder) {
       throw new Error("Encoder is not initialized.");
     }
 
-    this.encoder.encode(frame as VideoFrame & AudioData, {
-      keyFrame: this.#frameCount % this.#keyframeInterval === 0,
-    });
-
-    this.#frameCount++;
-
-    frame.close();
+    try {
+      this.encoder.encode(frame as VideoFrame & AudioData, {
+        keyFrame: this.#frameCount % this.#keyframeInterval === 0,
+      });
+      this.#frameCount++;
+    } finally {
+      frame.close();
+    }
   }
 
   protected handleOutput(
@@ -200,11 +162,14 @@ export class VideoEncoderTrack extends BaseEncoderTrack {
         timestamp,
         isKey: chunk.type === "key",
       });
-
-      this.lastTimestamp = timestamp;
     } catch (error) {
       Logger.error(`Failed to handle video chunk: ${error}`);
     }
+  }
+
+  async flush(): Promise<void> {
+    await super.flush();
+    this.#frameCount = 0;
   }
 
   reset(): void {
@@ -227,18 +192,15 @@ export class AudioEncoderTrack extends BaseEncoderTrack {
   }
 
   addTrackChunk(chunk: VideoFrame | AudioData): void {
-    if (this.state !== "recording") {
-      chunk.close();
-      return;
-    }
-
     if (!this.encoder) {
       throw new Error("Encoder is not initialized.");
     }
 
-    this.encoder.encode(chunk as VideoFrame & AudioData);
-
-    chunk.close();
+    try {
+      this.encoder.encode(chunk as VideoFrame & AudioData);
+    } finally {
+      chunk.close();
+    }
   }
 
   protected handleOutput(
@@ -263,8 +225,6 @@ export class AudioEncoderTrack extends BaseEncoderTrack {
         timestamp,
         isKey: chunk.type === "key",
       });
-
-      this.lastTimestamp = timestamp;
     } catch (error) {
       Logger.error(`Failed to handle audio chunk: ${error}`);
     }
