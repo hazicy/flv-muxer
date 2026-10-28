@@ -39,6 +39,8 @@ const muxer = new FlvMuxer(
     chunked: boolean; // 是否分块传输
     maxInterleaveDelayMs?: number;
     maxPendingChunks?: number;
+    maxEncodeQueueSize?: number;
+    maxOutputBytes?: number;
   }
 )
 ```
@@ -47,8 +49,16 @@ const muxer = new FlvMuxer(
 | --- | --- | --- |
 | `maxInterleaveDelayMs` | `200` | 交织最大等待毫秒数，有限非负数 |
 | `maxPendingChunks` | `256` | 交织队列最大包数，正整数 |
+| `maxEncodeQueueSize` | `32` | 每条轨道待编码请求上限，正整数 |
+| `maxOutputBytes` | `8388608` | 输出缓存字节上限（含正在写入的数据），正安全整数 |
 
-轨道停帧时，等待超时或队列超限会继续输出，不会自动补视频帧。迟到包的时间戳会向前调整，可能压缩播放间隔。上述限制仅针对交织队列。
+轨道停帧时，等待超时或队列超限会继续输出，不会自动补视频帧。迟到包的时间戳会向前调整，可能压缩播放间隔。`maxPendingChunks` 和 `maxInterleaveDelayMs` 仅限制交织队列。
+
+`live` 模式在视频编码队列满或输出缓存达到一半时丢弃新输入的视频帧；`record` 模式过载会报 `BackpressureError`。音频编码队列满或输出缓存超限时，两种模式都会报错并停止。
+
+编码、刷新或写入失败会清理队列、定时器和编码器，尝试中止输出，并使 `start()` 及进行中的 `pause()` / `stop()` 拒绝。失败后的实例不可复用。输入帧由 muxer 负责关闭，包括丢弃和报错时。
+
+输出流的 `write()` 应返回实际写入完成的 Promise；若内部直接缓存并立即返回，muxer 无法感知其积压。
 
 #### 方法
 
@@ -112,6 +122,7 @@ const muxer = new FlvMuxer(
 ```ts
 // 配置轨道后启动；此处不要 await。
 const finished = muxer.start();
+finished.catch(console.error); // 处理异步编码或输出错误
 muxer.addRawChunk("video", frame); // 采集期间持续输入
 
 await muxer.pause(); // 需要暂停时

@@ -1,6 +1,8 @@
 import type { AudioEncoderTrack, VideoEncoderTrack } from "./encoder-track";
 import { TrackState } from "./encoder-track";
 import { EventBus } from "./event-bus";
+import { asError, BackpressureError } from "./errors";
+import type { MuxerMode } from "./flv-muxer";
 
 export type ProcessorState = "recording" | "paused" | "inactive";
 
@@ -26,27 +28,50 @@ export class StreamProcessor {
 
   #timer?: ReturnType<typeof setTimeout>;
   #transition?: Promise<void>;
+  #error?: Error;
+  #failure: Promise<never>;
+  #rejectFailure!: (error: Error) => void;
 
   constructor(
     private readonly eventBus: EventBus,
     private readonly maxInterleaveDelayMs = 200,
-    private readonly maxPendingChunks = 256
+    private readonly maxPendingChunks = 256,
+    private readonly mode: MuxerMode = "record",
+    private readonly maxEncodeQueueSize = 32,
+    private readonly outputPressured: () => boolean = () => false
   ) {
     if (
       !Number.isFinite(maxInterleaveDelayMs) ||
       maxInterleaveDelayMs < 0 ||
       !Number.isInteger(maxPendingChunks) ||
-      maxPendingChunks < 1
+      maxPendingChunks < 1 ||
+      !Number.isInteger(maxEncodeQueueSize) ||
+      maxEncodeQueueSize < 1
     ) {
-      throw new Error("Invalid interleave queue limits");
+      throw new Error("Invalid queue limits");
     }
 
-    eventBus.on("TRACK_CHUNK", (chunk: TrackChunk) =>
-      this.handleTrackChunk(chunk)
-    );
+    this.#failure = new Promise<never>((_, reject) => {
+      this.#rejectFailure = reject;
+    });
+    void this.#failure.catch(() => {});
+
+    eventBus.on("ERROR", (error: Error) => this.fail(error));
+    eventBus.on("TRACK_CHUNK", (chunk: TrackChunk) => {
+      try {
+        this.handleTrackChunk(chunk);
+      } catch (reason) {
+        eventBus.emit("ERROR", asError(reason));
+      }
+    });
   }
 
   addTrackChunk(type: "audio" | "video", chunk: VideoFrame | AudioData): void {
+    if (this.#error) {
+      chunk.close();
+      throw this.#error;
+    }
+
     const track =
       type === "audio" ? this.#audioEncoderTrack : this.#videoEncoderTrack;
 
@@ -55,9 +80,35 @@ export class StreamProcessor {
       return;
     }
 
+    const encoderFull = (track.encodeQueueSize ?? 0) >= this.maxEncodeQueueSize;
+
+    if (encoderFull || this.outputPressured()) {
+      if (this.mode === "live" && type === "video") {
+        chunk.close();
+        return;
+      }
+
+      // Audio may continue while live video is shedding frames, until a hard limit.
+      if (encoderFull || this.mode === "record") {
+        chunk.close();
+        const error = new BackpressureError("Encoder or output queue is full");
+        this.eventBus.emit("ERROR", error);
+        throw error;
+      }
+    }
+
     // Anchor to input order, independently of encoder callback scheduling.
     this.trackState.offsetTimestamp ??= chunk.timestamp;
-    track.addTrackChunk(chunk);
+
+    try {
+      track.addTrackChunk(chunk);
+    } catch (reason) {
+      const error = asError(reason);
+      this.eventBus.emit("ERROR", error);
+      throw error;
+    }
+
+    if (this.#error) throw this.#error;
   }
 
   addAudioTrack(track: AudioEncoderTrack): void {
@@ -71,6 +122,8 @@ export class StreamProcessor {
   }
 
   handleTrackChunk(chunk: TrackChunk): void {
+    if (this.#error) return;
+
     if (chunk.type === "AAC_SE" || chunk.type === "AVC_SE") {
       this.eventBus.emit("CHUNK_PUBLISH", chunk);
       return;
@@ -133,7 +186,13 @@ export class StreamProcessor {
       );
 
       this.#timer = setTimeout(
-        () => this.#drain(),
+        () => {
+          try {
+            this.#drain();
+          } catch (reason) {
+            this.eventBus.emit("ERROR", asError(reason));
+          }
+        },
         Math.max(
           1,
           this.maxInterleaveDelayMs - (performance.now() - oldestArrival)
@@ -143,6 +202,8 @@ export class StreamProcessor {
   }
 
   start(): void {
+    if (this.#error) throw this.#error;
+
     if (this.state !== "inactive" || this.#transition)
       throw new Error("Processor is already active");
 
@@ -150,6 +211,8 @@ export class StreamProcessor {
   }
 
   pause(): Promise<void> {
+    if (this.#error) return Promise.reject(this.#error);
+
     if (this.#transition) return this.#transition;
     if (this.state !== "recording") return Promise.resolve();
 
@@ -159,6 +222,8 @@ export class StreamProcessor {
   }
 
   resume(): void {
+    if (this.#error) throw this.#error;
+
     if (this.#transition)
       throw new Error("Wait for pause() to finish before resuming");
 
@@ -166,6 +231,8 @@ export class StreamProcessor {
   }
 
   async stop(): Promise<void> {
+    if (this.#error) throw this.#error;
+
     if (this.state === "inactive") return;
 
     this.state = "paused";
@@ -173,7 +240,14 @@ export class StreamProcessor {
     if (this.#transition) await this.#transition;
     await this.#flush();
 
-    this.reset();
+    try {
+      this.reset();
+    } catch (reason) {
+      const error = asError(reason);
+      this.eventBus.emit("ERROR", error);
+      throw error;
+    }
+
     this.state = "inactive";
   }
 
@@ -189,13 +263,46 @@ export class StreamProcessor {
     this.trackState.offsetTimestamp = undefined;
   }
 
+  fail(error: Error): void {
+    if (this.#error) return;
+
+    this.#error = error;
+    this.state = "inactive";
+
+    clearTimeout(this.#timer);
+    this.#queue = [];
+    this.trackState.offsetTimestamp = undefined;
+
+    for (const track of [this.#audioEncoderTrack, this.#videoEncoderTrack]) {
+      try {
+        track?.close();
+      } catch {
+        /* Preserve the original failure. */
+      }
+    }
+
+    this.#rejectFailure(error);
+  }
+
   #flush(): Promise<void> {
-    this.#transition = Promise.all([
-      this.#audioEncoderTrack?.flush(),
-      this.#videoEncoderTrack?.flush(),
+    this.#transition = Promise.race([
+      this.#failure,
+      Promise.resolve().then(() =>
+        Promise.all([
+          this.#audioEncoderTrack?.flush(),
+          this.#videoEncoderTrack?.flush(),
+        ])
+      ),
     ])
       .then(() => {
+        if (this.#error) throw this.#error;
         this.#drain(true);
+        if (this.#error) throw this.#error;
+      })
+      .catch((reason) => {
+        const error = this.#error ?? asError(reason);
+        this.eventBus.emit("ERROR", error);
+        throw error;
       })
       .finally(() => {
         clearTimeout(this.#timer);

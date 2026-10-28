@@ -39,6 +39,8 @@ const muxer = new FlvMuxer(
     chunked: boolean; // Whether to transmit in chunks
     maxInterleaveDelayMs?: number;
     maxPendingChunks?: number;
+    maxEncodeQueueSize?: number;
+    maxOutputBytes?: number;
   }
 );
 ```
@@ -47,8 +49,16 @@ const muxer = new FlvMuxer(
 | --- | --- | --- |
 | `maxInterleaveDelayMs` | `200` | Maximum interleaving wait in milliseconds; finite and nonnegative |
 | `maxPendingChunks` | `256` | Maximum interleaving queue size in packets; positive integer |
+| `maxEncodeQueueSize` | `32` | Pending encode request limit per track; positive integer |
+| `maxOutputBytes` | `8388608` | Output byte limit, including the in-flight write; positive safe integer |
 
-If a track stalls, output continues after the timeout or when the queue exceeds its limit. No video frames are synthesized. Late timestamps are moved forward, which can compress playback intervals. These limits apply only to the interleaving queue.
+If a track stalls, output continues after the timeout or when the queue exceeds its limit. No video frames are synthesized. Late timestamps are moved forward, which can compress playback intervals. `maxPendingChunks` and `maxInterleaveDelayMs` apply only to the interleaving queue.
+
+In `live` mode, new video frames are dropped when the video encoder queue is full or output reaches half its byte limit. In `record` mode, overload raises `BackpressureError`. A full audio encoder queue or exceeded output byte limit stops either mode with an error.
+
+Encoding, flushing, or writing failures clear queues and timers, close encoders, attempt to abort output, and reject `start()` and pending `pause()` / `stop()` calls. Failed instances cannot restart. The muxer closes submitted frames, including on drops and errors.
+
+The sink's `write()` should return a promise that resolves when the write completes. Buffering inside a sink that returns immediately cannot be tracked by the muxer.
 
 #### Methods
 
@@ -112,6 +122,7 @@ If a track stalls, output continues after the timeout or when the queue exceeds 
 ```ts
 // Configure tracks first; do not await start() here.
 const finished = muxer.start();
+finished.catch(console.error); // Handle asynchronous encoding or output errors.
 muxer.addRawChunk("video", frame); // Submit frames throughout capture.
 
 await muxer.pause(); // When pausing.

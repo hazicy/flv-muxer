@@ -9,6 +9,8 @@ import { AudioEncoderTrack, VideoEncoderTrack } from "./encoder-track";
 import { EventBus } from "./event-bus";
 import { FlvEncoder } from "./flv-encoder";
 import { StreamProcessor, type TrackChunk } from "./stream-processor";
+import { asError } from "./errors";
+import { OutputWriter } from "./output-writer";
 
 export type MuxerMode = "record" | "live";
 
@@ -26,6 +28,8 @@ interface MuxerOptions {
   chunked: boolean;
   maxInterleaveDelayMs?: number;
   maxPendingChunks?: number;
+  maxEncodeQueueSize?: number;
+  maxOutputBytes?: number;
   video?: VideoOptions;
   audio?: AudioOptions;
 }
@@ -36,14 +40,26 @@ export class FlvMuxer {
   readonly #streamProcessor: StreamProcessor;
   readonly #outputStream: WritableStream | undefined;
 
-  #pipeline?: Promise<void>;
+  #completion?: Promise<void>;
+  #resolveCompletion?: () => void;
+  #rejectCompletion?: (error: Error) => void;
   #stopping?: Promise<void>;
+  #pausing?: Promise<void>;
+  #error?: Error;
+  #output?: OutputWriter;
   #options: MuxerOptions;
-  #sourceStream: ReadableStream | undefined;
-  #sourceStreamController: ReadableStreamDefaultController | undefined;
-  #muxStream: TransformStream | undefined;
   #strategies: { [key: string]: MuxStrategy } = {};
-  #readableHandler: undefined | ((chunk: Uint8Array) => void);
+
+  #publish = (chunk: TrackChunk): void => {
+    if (this.#error) return;
+
+    try {
+      const tag = this.#muxChunk(chunk);
+      if (tag) this.#output?.enqueue(tag);
+    } catch (reason) {
+      this.#fail(asError(reason));
+    }
+  };
 
   get state() {
     return this.#streamProcessor.state;
@@ -56,6 +72,8 @@ export class FlvMuxer {
       chunked: boolean;
       maxInterleaveDelayMs?: number;
       maxPendingChunks?: number;
+      maxEncodeQueueSize?: number;
+      maxOutputBytes?: number;
     }
   ) {
     if (!(writable instanceof WritableStream)) {
@@ -64,15 +82,25 @@ export class FlvMuxer {
       );
     }
 
+    const maxOutputBytes = options.maxOutputBytes ?? 8 * 1024 * 1024;
+
+    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) {
+      throw new Error("maxOutputBytes must be a positive safe integer");
+    }
+
     this.#encoder = new FlvEncoder();
     this.#eventBus = new EventBus();
     this.#streamProcessor = new StreamProcessor(
       this.#eventBus,
       options.maxInterleaveDelayMs,
-      options.maxPendingChunks
+      options.maxPendingChunks,
+      options.mode,
+      options.maxEncodeQueueSize,
+      () => this.#output?.pressured ?? false
     );
     this.#outputStream = writable;
-    this.#options = { ...options };
+    this.#options = { ...options, maxOutputBytes };
+    this.#eventBus.on("ERROR", (error: Error) => this.#fail(error));
 
     // 初始化策略
     this.#initStrategies();
@@ -90,14 +118,14 @@ export class FlvMuxer {
   }
 
   configureAudio(options: AudioOptions): void {
+    if (this.#error) throw this.#error;
+
     if (this.state !== "inactive" || this.#stopping)
       throw new Error("Configure tracks before starting");
 
     if (!options.encoderConfig) {
       throw new Error("Audio encoder configuration cannot be empty");
     }
-
-    this.#options.audio = options;
 
     this.#streamProcessor.addAudioTrack(
       new AudioEncoderTrack(
@@ -106,9 +134,13 @@ export class FlvMuxer {
         this.#streamProcessor.trackState
       )
     );
+
+    this.#options.audio = options;
   }
 
   configureVideo(options: VideoOptions): void {
+    if (this.#error) throw this.#error;
+
     if (this.state !== "inactive" || this.#stopping)
       throw new Error("Configure tracks before starting");
 
@@ -123,8 +155,6 @@ export class FlvMuxer {
       throw new Error("keyframeInterval must be a positive integer");
     }
 
-    this.#options.video = options;
-
     this.#streamProcessor.addVideoTrack(
       new VideoEncoderTrack(
         options.encoderConfig,
@@ -133,63 +163,104 @@ export class FlvMuxer {
         this.#streamProcessor.trackState
       )
     );
+
+    this.#options.video = options;
   }
 
-  async start(): Promise<void> {
-    if (this.state !== "inactive" || this.#stopping)
-      throw new Error("Muxer is already active");
+  start(): Promise<void> {
+    if (this.#error) return Promise.reject(this.#error);
 
-    if (!this.#options?.audio && !this.#options?.video) {
-      throw new Error(
-        "Muxer is not configured with audio or video tracks. Please call configureAudio() or configureVideo() first."
+    if (this.state !== "inactive" || this.#stopping) {
+      return Promise.reject(new Error("Muxer is already active"));
+    }
+
+    if (!this.#options.audio && !this.#options.video) {
+      return Promise.reject(
+        new Error("Configure at least one track before starting")
       );
     }
 
+    this.#completion = new Promise<void>((resolve, reject) => {
+      this.#resolveCompletion = resolve;
+      this.#rejectCompletion = reject;
+    });
+    // The returned promise still rejects; observing it here avoids background rejections.
+    void this.#completion.catch(() => {});
+
     try {
-      this.#initSourceStream();
-      this.#initMuxStream();
-
-      if (!this.#sourceStream || !this.#muxStream || !this.#outputStream) {
-        throw new Error("Failed to initialize streams");
-      }
-
+      this.#output = new OutputWriter(
+        this.#outputStream!,
+        this.#options.maxOutputBytes!,
+        (error) => this.#fail(error)
+      );
+      this.#eventBus.on("CHUNK_PUBLISH", this.#publish);
       this.#streamProcessor.start();
 
-      this.#pipeline = this.#sourceStream
-        .pipeThrough(this.#muxStream)
-        .pipeTo(this.#outputStream, {
-          preventClose: true,
-        });
-
-      await this.#pipeline;
-    } catch (error) {
-      throw new Error(`Error starting Muxer: ${error}`);
+      this.#output.enqueue(
+        this.#encoder.encodeFlvHeader(
+          !!this.#options.video,
+          !!this.#options.audio
+        )
+      );
+      this.#output.enqueue(this.#encodeMetadata());
+    } catch (reason) {
+      this.#fail(asError(reason));
     }
+
+    return this.#completion;
   }
 
   pause(): Promise<void> {
-    return this.#streamProcessor.pause();
+    if (this.#error) return Promise.reject(this.#error);
+    if (this.#pausing) return this.#pausing;
+    if (this.#stopping) return this.#stopping;
+    if (this.state !== "recording") return Promise.resolve();
+
+    this.#pausing = (async () => {
+      try {
+        await this.#streamProcessor.pause();
+        await this.#output?.drain();
+        if (this.#error) throw this.#error;
+      } catch (reason) {
+        this.#fail(asError(reason));
+        throw this.#error;
+      } finally {
+        this.#pausing = undefined;
+      }
+    })();
+
+    return this.#pausing;
   }
 
   resume(): void {
+    if (this.#error) throw this.#error;
+    if (this.#pausing || this.#stopping) {
+      throw new Error("Wait for the pending lifecycle operation to finish");
+    }
+
     this.#streamProcessor.resume();
   }
 
   stop(): Promise<void> {
+    if (this.#error) return Promise.reject(this.#error);
     if (this.#stopping) return this.#stopping;
     if (this.state === "inactive") return Promise.resolve();
 
     this.#stopping = (async () => {
       try {
+        if (this.#pausing) await this.#pausing;
         await this.#streamProcessor.stop();
-        this.#sourceStreamController?.close();
-        await this.#pipeline;
-      } finally {
-        if (this.#readableHandler) {
-          this.#eventBus.off("CHUNK_PUBLISH", this.#readableHandler);
-        }
+        await this.#output?.drain();
 
-        this.#sourceStreamController = undefined;
+        if (this.#error) throw this.#error;
+        this.#output?.release();
+        this.#output = undefined;
+        this.#resolveCompletion?.();
+      } catch (reason) {
+        this.#fail(asError(reason));
+        throw this.#error;
+      } finally {
+        this.#eventBus.off("CHUNK_PUBLISH", this.#publish);
         this.#stopping = undefined;
       }
     })();
@@ -197,35 +268,16 @@ export class FlvMuxer {
     return this.#stopping;
   }
 
-  #initSourceStream(): void {
-    this.#sourceStream = new ReadableStream({
-      start: (controller) => {
-        this.#sourceStreamController = controller;
-        this.#readableHandler = (chunk: Uint8Array) => {
-          controller.enqueue(chunk);
-        };
+  #fail(error: Error): void {
+    if (this.#error) return;
 
-        this.#eventBus.on("CHUNK_PUBLISH", this.#readableHandler);
-      },
-    });
-  }
+    this.#error = error;
 
-  #initMuxStream(): void {
-    this.#muxStream = new TransformStream({
-      start: async (controller) => {
-        const header = this.#encoder.encodeFlvHeader(
-          !!this.#options.video,
-          !!this.#options.audio
-        );
-        const metadata = this.#encodeMetadata();
-        controller.enqueue(header);
-        controller.enqueue(metadata);
-      },
-      transform: (chunk, controller) => {
-        const tag = this.#muxChunk(chunk);
-        controller.enqueue(tag);
-      },
-    });
+    this.#streamProcessor.fail(error);
+    this.#eventBus.off("CHUNK_PUBLISH", this.#publish);
+    this.#output?.fail(error);
+    this.#output = undefined;
+    this.#rejectCompletion?.(error);
   }
 
   #encodeMetadata(): Uint8Array {

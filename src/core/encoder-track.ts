@@ -1,4 +1,4 @@
-import { Logger } from "../utils/logger";
+import { asError } from "./errors";
 import { EventBus } from "./event-bus";
 
 type EncodedMediaChunk = EncodedAudioChunk | EncodedVideoChunk;
@@ -51,7 +51,16 @@ export abstract class BaseEncoderTrack {
     this.trackState = trackState;
     this.config = config;
 
-    this.initEncoder(config);
+    try {
+      this.initEncoder(config);
+    } catch (reason) {
+      try {
+        this.close();
+      } catch {
+        /* Preserve configuration errors. */
+      }
+      throw reason;
+    }
   }
 
   abstract addTrackChunk(chunk: VideoFrame | AudioData): void;
@@ -65,12 +74,16 @@ export abstract class BaseEncoderTrack {
     config: VideoEncoderConfig | AudioEncoderConfig
   ): void;
 
-  close(): void {
-    if (!this.encoder) {
-      throw new Error("Encoder is not initialized.");
-    }
+  get encodeQueueSize(): number {
+    return this.encoder?.encodeQueueSize ?? 0;
+  }
 
-    this.encoder.close();
+  close(): void {
+    if (this.encoder && this.encoder.state !== "closed") this.encoder.close();
+  }
+
+  protected reportError(reason: unknown): void {
+    this.eventBus.emit("ERROR", asError(reason));
   }
 
   reset(): void {
@@ -116,10 +129,7 @@ export class VideoEncoderTrack extends BaseEncoderTrack {
   protected initEncoder(config: VideoEncoderConfig): void {
     this.encoder = new VideoEncoder({
       output: this.handleOutput.bind(this),
-      error: (error) => {
-        Logger.error(`VideoEncoder error: ${error}`);
-        throw new Error(error.message);
-      },
+      error: (error) => this.reportError(error),
     });
 
     this.encoder.configure(config);
@@ -163,7 +173,7 @@ export class VideoEncoderTrack extends BaseEncoderTrack {
         isKey: chunk.type === "key",
       });
     } catch (error) {
-      Logger.error(`Failed to handle video chunk: ${error}`);
+      this.reportError(error);
     }
   }
 
@@ -182,10 +192,7 @@ export class AudioEncoderTrack extends BaseEncoderTrack {
   protected initEncoder(config: AudioEncoderConfig): void {
     this.encoder = new AudioEncoder({
       output: this.handleOutput.bind(this),
-      error: (error) => {
-        Logger.error(`AudioEncoder error:", ${error.message} `);
-        throw new Error(error.message);
-      },
+      error: (error) => this.reportError(error),
     });
 
     this.encoder.configure(config);
@@ -226,7 +233,7 @@ export class AudioEncoderTrack extends BaseEncoderTrack {
         isKey: chunk.type === "key",
       });
     } catch (error) {
-      Logger.error(`Failed to handle audio chunk: ${error}`);
+      this.reportError(error);
     }
   }
 }

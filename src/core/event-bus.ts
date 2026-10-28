@@ -1,5 +1,3 @@
-import { Logger } from "../utils/logger";
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type EventHandler = (...args: any[]) => void;
 
@@ -39,13 +37,7 @@ export class EventBus {
     if (!this.#events.has(eventName)) return;
 
     const handlers = this.#events.get(eventName)!;
-    handlers.forEach((handler) => {
-      try {
-        handler(...args);
-      } catch (error) {
-        Logger.error(`Error in event handler for ${eventName}: ${error}`);
-      }
-    });
+    handlers.forEach((handler) => handler(...args));
   }
 
   clear(): void {
