@@ -1,6 +1,6 @@
 {
   "name": "flv-muxer",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "type": "module",
   "main": "dist/flv-muxer.js",
   "types": "dist/flv-muxer.d.ts",
