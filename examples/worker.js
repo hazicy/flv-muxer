@@ -1,61 +1,81 @@
-// const ws = new WebSocket("ws://localhost:3000/livestream/push");
-
-// ws.onopen = () => {
-//   console.log("WebSocket connection established");
-// };
-
-// ws.onerror = (error) => {
-//   console.error("WebSocket error:", error);
-// };
-
-// ws.onclose = () => {
-//   console.log("WebSocket connection closed");
-// };
-
-const writable = new WritableStream({
-  write: (chunk) => {
-    self.postMessage(chunk.buffer, [chunk.buffer]);
-    // ws.send(chunk);
-  },
-});
-
 importScripts("../dist/flv-muxer.iife.js");
 
-flvMuxer = new FlvMuxer(writable, {
-  mode: "record",
-  chunked: false,
-});
+let muxer;
+let finished;
+let nextOutputId = 0;
+const writes = new Map();
+let failed = false;
 
-flvMuxer.configureVideo({
-  encoderConfig: {
-    codec: "avc1.640034",
-    width: 2560,
-    height: 1440,
-    framerate: 30,
-  },
-  keyframeInterval: 90,
-});
+function fail(error) {
+  if (failed) return;
+  failed = true;
+  for (const { reject } of writes.values()) reject(error);
+  writes.clear();
+  self.postMessage({ type: "ERROR", message: error.message ?? String(error) });
+}
 
-flvMuxer.configureAudio({
-  encoderConfig: {
-    codec: "mp4a.40.29",
-    sampleRate: 44100,
-    numberOfChannels: 2,
-  },
-});
+self.onmessage = async ({ data }) => {
+  if (data.type === "WRITE_ACK") {
+    const pending = writes.get(data.id);
+    writes.delete(data.id);
+    if (data.error) pending?.reject(new Error(data.error));
+    else pending?.resolve();
+    return;
+  }
 
-self.onmessage = async (e) => {
-  if (e.data.type === "DATA_VIDEO") {
-    flvMuxer.addRawChunk("video", e.data.chunk);
-  } else if (e.data.type == "DATA_AUDIO") {
-    flvMuxer.addRawChunk("audio", e.data.chunk);
-  } else if (e.data.type === "START") {
-    flvMuxer.start();
-  } else if (e.data.type === "PAUSE") {
-    await flvMuxer.pause();
-  } else if (e.data.type === "RESUME") {
-    flvMuxer.resume();
-  } else if (e.data.type === "STOP") {
-    await flvMuxer.stop();
+  try {
+    if (failed) {
+      data.chunk?.close();
+      return;
+    }
+    if (data.type === "START") {
+      const writable = new WritableStream({
+        write(chunk) {
+          const id = nextOutputId++;
+          return new Promise((resolve, reject) => {
+            writes.set(id, { resolve, reject });
+            self.postMessage({ type: "OUTPUT", id, buffer: chunk.buffer }, [chunk.buffer]);
+          });
+        },
+      });
+      muxer = new FlvMuxer(writable, {
+        mode: "record",
+        chunked: false,
+        maxEncodeQueueSize: 128,
+        maxInterleaveDelayMs: 5000,
+      });
+      const video = {
+        codec: "avc1.420033",
+        ...data.video,
+        bitrate: 8_000_000,
+        latencyMode: "realtime",
+        avc: { format: "avc" },
+      };
+      if (!(await VideoEncoder.isConfigSupported(video)).supported) {
+        throw new Error("此浏览器不支持当前屏幕尺寸的 H.264 编码");
+      }
+      muxer.configureVideo({ encoderConfig: video, keyframeInterval: 90 });
+      if (data.audio) {
+        const audio = { codec: "mp4a.40.2", ...data.audio, bitrate: 128_000 };
+        if (!(await AudioEncoder.isConfigSupported(audio)).supported) {
+          throw new Error("此浏览器不支持当前音轨的 AAC 编码");
+        }
+        muxer.configureAudio({ encoderConfig: audio });
+      }
+      finished = muxer.start();
+      finished.catch(fail);
+    } else if (data.type === "FRAME") {
+      muxer.addRawChunk(data.track, data.chunk);
+    } else if (data.type === "PAUSE") {
+      await muxer.pause();
+    } else if (data.type === "RESUME") {
+      muxer.resume();
+    } else if (data.type === "STOP") {
+      await muxer.stop();
+      await finished;
+    }
+    if (!failed) self.postMessage({ type: "ACK", id: data.id });
+  } catch (error) {
+    fail(error);
   }
 };

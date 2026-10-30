@@ -147,3 +147,13 @@ pnpm test:browser              # Native Chrome integration tests, about 45 secon
 Browser tests require Node.js 20+ and an installed Google Chrome. Native WebCodecs encode and decode synthetic audio/video to check FLV integrity, timestamp synchronization, a 30-second video stall, pause/restart, slow-output frame dropping, buffer transfer, and write failures. The static case samples retained JS heap after GC (not native codec memory); FLV files and heap samples are saved under `test-results/browser/`.
 
 Realtime cases explicitly use `prefer-software`. The default encoder path uses an encode queue limit of `128` and a `5000ms` interleaving wait to accommodate cold starts. Its startup took about two seconds locally; default budgets can overload or move late video timestamps forward. These tests do not establish suitable defaults for all hardware or cover screen-capture permissions and third-party players.
+
+## Screen recording example
+
+Run `pnpm build`, then serve the repository with `python3 -m http.server 8080` and open `http://localhost:8080/examples/` in desktop Chrome.
+
+Click “选择保存位置” to choose an output file, then click Start Recording to select a screen. The example configures H.264/AAC from the captured tracks and supports video without audio. It writes chunks directly to disk rather than retaining the entire recording in memory. Pause and stop wait for encoding and file writes; the file closes only after the worker confirms completion. Ending screen sharing also saves the recording. Choose another output file and start again to create another recording.
+
+Requires HTTPS or localhost, WebCodecs, MediaStreamTrackProcessor, and the File System Access API. Cancellation and encoding or disk errors release capture resources and the worker and abort the file write. The example allows extra encoder cold-start headroom; overloaded devices can still fail, with the error shown on the page.
+
+Inspect the saved file with `ffprobe recording.flv` and a player such as VLC to check audio, video, and the end of the recording. Screen permissions, system audio availability, and third-party player compatibility require manual verification.

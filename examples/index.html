@@ -60,6 +60,11 @@
         min-width: 130px;
       }
 
+      .button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
       .button:hover {
         transform: translateY(-2px);
       }
@@ -167,7 +172,7 @@
     <div class="container">
       <h1>FlvMuxer</h1>
 
-      <div class="preview">Preview Area</div>
+      <video class="preview" autoplay muted playsinline aria-label="屏幕预览"></video>
 
       <div class="status">
         <span class="status-indicator"></span>
@@ -177,6 +182,9 @@
       <div class="timer">00:00:00</div>
 
       <div class="controls">
+        <button class="button select-button" type="button" onclick="chooseFile()">
+          选择保存位置
+        </button>
         <button
           class="button start-button"
           type="button"
@@ -257,7 +265,6 @@
       </div>
     </div>
 
-    <script src="../dist/flv-muxer.iife.js"></script>
     <script src="./example.js"></script>
   </body>
 </html>
